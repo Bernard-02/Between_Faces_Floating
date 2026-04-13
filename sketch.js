@@ -14,9 +14,10 @@
     sources: [], // { el: HTMLVideoElement, name, ready }
     // Active floating clips on-screen
     clips: [],
-    // Schedule: array of { sourceIndex, birthTime, deathTime }
-    schedule: [],
-    nextScheduleIdx: 0,
+    // Dynamic spawner state
+    nextSourceIdx: 0,
+    lastSpawnTime: 0,
+    spawnBandIdx: 0, // rotates through vertical bands for even distribution
 
     // Playhead in seconds (drives both preview and export)
     time: 0,
@@ -26,18 +27,24 @@
 
     // Params (synced to UI)
     bgColor: '#0a0a0a',
-    speed: 1.0,
-    onscreenCount: 15,
+    speed: 0.5,
+    onscreenCount: 10,
     duration: 150,
     minW: 160,
     maxW: 320,
-    canvasW: 1920,
-    canvasH: 1080,
+    canvasW: 3400,
+    canvasH: 1200,
     fadeTime: 0.8,
+    parallax: 0.7, // fixed
 
-    // Recorder
+    // Recorder / encoder
     recorder: null,
     recordedChunks: [],
+    encoder: null,
+    muxer: null,
+    encoderFrameIdx: 0,
+    exportFormat: 'mp4',
+    statusTick: null,
   };
 
   // Expose a minimal hook for the ffmpeg helper
@@ -58,7 +65,6 @@
     };
 
     p.draw = () => {
-      // Advance time
       if (state.running) {
         const now = performance.now() / 1000;
         const dt = Math.min(0.1, now - state.lastRealTime);
@@ -67,20 +73,46 @@
 
         spawnDueClips();
         updateClips(dt);
+      }
 
-        // Stop when done (export or preview)
-        if (state.time >= state.duration) {
-          if (state.exporting) {
-            stopExport();
-          } else {
-            stopPreview();
-          }
+      p.background(state.bgColor);
+      for (const c of state.clips) drawClip(p, c);
+
+      // Capture frame for mp4 (WebCodecs) export — do this before stop so the
+      // final frame at t≈duration still gets encoded.
+      if (
+        state.exporting &&
+        state.exportFormat === 'mp4' &&
+        state.encoder &&
+        state.encoder.state === 'configured'
+      ) {
+        try {
+          const tsUs = Math.max(1, Math.round(state.time * 1_000_000));
+          // Copy p5 canvas into the dedicated 2D encode canvas first so that
+          // VideoFrame can always read a valid colorSpace from it. Explicit
+          // dest size downsamples HiDPI backing (p.canvas is pixelDensity×
+          // larger than logical size) to the intended export resolution.
+          state.encodeCtx.drawImage(
+            p.canvas,
+            0,
+            0,
+            state.encodeCanvas.width,
+            state.encodeCanvas.height
+          );
+          const frame = new VideoFrame(state.encodeCanvas, { timestamp: tsUs });
+          const keyFrame = state.encoderFrameIdx % 120 === 0;
+          state.encoder.encode(frame, { keyFrame });
+          frame.close();
+          state.encoderFrameIdx++;
+        } catch (e) {
+          console.error('frame encode failed', e);
         }
       }
 
-      // Draw
-      p.background(state.bgColor);
-      for (const c of state.clips) drawClip(p, c);
+      if (state.running && state.time >= state.duration) {
+        if (state.exporting) stopExport();
+        else stopPreview();
+      }
     };
 
     p.windowResized = fitCanvasToWrap;
@@ -104,11 +136,8 @@
 
     function drawClip(p, c) {
       const el = c.source.el;
-      // Compute alpha+scale from phase
       const { alpha, scale } = clipTransform(c);
       if (alpha <= 0.001) return;
-
-      // Video may not be ready yet; skip until metadata loaded
       if (el.readyState < 2) return;
 
       const vw = el.videoWidth || 640;
@@ -116,14 +145,12 @@
       const drawW = c.size * scale;
       const drawH = (drawW * vh) / vw;
 
-      p.push();
-      p.translate(c.pos.x, c.pos.y);
-      if (c.rotation) p.rotate(c.rotation);
-      p.tint(255, 255 * alpha);
-      // p5 can draw HTMLVideoElement directly via image()
-      p.imageMode(p.CENTER);
-      p.image(el, 0, 0, drawW, drawH);
-      p.pop();
+      const ctx = p.drawingContext;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.translate(c.pos.x, c.pos.y);
+      ctx.drawImage(el, -drawW / 2, -drawH / 2, drawW, drawH);
+      ctx.restore();
     }
 
     p.exposeFit = fitCanvasToWrap;
@@ -134,93 +161,100 @@
 
   // ---------- Clip lifecycle ----------
   function clipTransform(c) {
-    const t = state.time;
-    const inStart = c.birthTime;
-    const inEnd = c.birthTime + state.fadeTime;
-    const outStart = c.deathTime - state.fadeTime;
-    const outEnd = c.deathTime;
-
-    let alpha = 1;
-    let scale = 1;
-    if (t < inStart) {
-      alpha = 0;
-      scale = 0.6;
-    } else if (t < inEnd) {
-      const k = easeOutCubic((t - inStart) / state.fadeTime);
-      alpha = k;
-      scale = 0.6 + 0.4 * k;
-    } else if (t < outStart) {
-      alpha = 1;
-      scale = 1;
-    } else if (t < outEnd) {
-      const k = 1 - easeInCubic((t - outStart) / state.fadeTime);
-      alpha = k;
-      scale = 0.6 + 0.4 * k;
-    } else {
-      alpha = 0;
-      scale = 0.6;
+    const age = state.time - c.birthTime;
+    if (age < 0) return { alpha: 0, scale: 0.6 };
+    if (age < state.fadeTime) {
+      const k = easeOutCubic(age / state.fadeTime);
+      return { alpha: k, scale: 0.6 + 0.4 * k };
     }
-    return { alpha, scale };
+    return { alpha: 1, scale: 1 };
   }
 
   function easeOutCubic(x) {
     return 1 - Math.pow(1 - Math.min(1, Math.max(0, x)), 3);
   }
-  function easeInCubic(x) {
-    const k = Math.min(1, Math.max(0, x));
-    return k * k * k;
-  }
 
   function spawnDueClips() {
-    while (
-      state.nextScheduleIdx < state.schedule.length &&
-      state.schedule[state.nextScheduleIdx].birthTime <= state.time
-    ) {
-      const entry = state.schedule[state.nextScheduleIdx++];
-      spawnClip(entry);
+    if (state.sources.length === 0) return;
+    // Spawn cadence reacts to current speed + onscreenCount, so changes to
+    // either take effect immediately mid-preview.
+    const spd = Math.max(0.05, state.speed);
+    const interval = Math.max(
+      0.1,
+      AVG_CROSS_TIME / (spd * Math.max(1, state.onscreenCount))
+    );
+    if (state.time - state.lastSpawnTime < interval) return;
+    // Hard cap so a sudden parameter change can't pile up clips.
+    if (state.clips.length >= state.onscreenCount * 1.3) {
+      state.lastSpawnTime = state.time;
+      return;
     }
+    const idx = state.nextSourceIdx % state.sources.length;
+    state.nextSourceIdx++;
+    spawnClip({ sourceIndex: idx, birthTime: state.time });
+    state.lastSpawnTime = state.time;
   }
 
   function spawnClip(entry) {
     const source = state.sources[entry.sourceIndex];
     if (!source) return;
 
-    // Clone-free: reuse the <video> element. Since each source is unique in the
-    // schedule (83 clips, 83 sources), reusing the element is fine.
+    // Reuse the <video> element. When few sources feed many clips, several
+    // on-screen clips may share an element and therefore the same frame —
+    // acceptable visually, and avoids the playhead jumping mid-playback.
     const el = source.el;
-    // Give each a random phase within its 4s ping-pong loop
-    try {
-      el.currentTime = Math.random() * Math.max(0.1, (el.duration || 4) - 0.1);
-    } catch (e) {
-      /* noop */
+    if (el.paused) {
+      const pp = el.play();
+      if (pp && pp.catch) pp.catch(() => {});
     }
-    // Ensure playing
-    const playPromise = el.play();
-    if (playPromise && playPromise.catch) playPromise.catch(() => {});
 
-    const size = randRange(state.minW, state.maxW);
-    // Start just past right edge
+    // Parallax depth ∈ [0,1]. 0 = far (smaller, slower), 1 = near (bigger, faster).
+    const depth = Math.random();
+    const px = state.parallax;
+    const depthSize = 1 + (depth * 2 - 1) * px * 0.55;
+    const depthSpeed = 1 + (depth * 2 - 1) * px * 0.7;
+
+    const baseSize = randRange(state.minW, state.maxW);
+    const size = Math.max(30, baseSize * depthSize);
     const startX = state.canvasW + size * 0.6;
-    const y = randRange(size * 0.4, state.canvasH - size * 0.4);
+    // Vertical safe zone: real wall is 300cm tall, clips stay within 30–270cm
+    // (10% margin top & bottom). Account for clip half-size + wobble headroom.
+    const topPx = state.canvasH * 0.1 + size * 0.6;
+    const botPx = state.canvasH * 0.9 - size * 0.6;
+    let y;
+    if (topPx >= botPx) {
+      y = state.canvasH * 0.5;
+    } else {
+      // Stratified vertical placement: divide the safe zone into N bands and
+      // rotate through them so successive clips don't pile up in one area.
+      const bands = Math.max(3, state.onscreenCount);
+      // Multiply by a stride coprime to most band counts so the sequence
+      // visits every band but in a scrambled, non-sweeping order.
+      const bandIdx = (state.spawnBandIdx * 7) % bands;
+      state.spawnBandIdx++;
+      const bandH = (botPx - topPx) / bands;
+      const center = topPx + (bandIdx + 0.5) * bandH;
+      y = center + (Math.random() - 0.5) * bandH * 0.5;
+    }
 
-    // Leftward drift so the clip naturally exits to the left by deathTime
-    const lifeLen = Math.max(0.1, entry.deathTime - entry.birthTime);
+    // Fixed pixel velocity — average clip crosses canvas in ~AVG_CROSS_TIME s.
     const travel = state.canvasW + size * 1.2;
-    const baseVx = -travel / lifeLen;
+    const baseVx = (-travel / AVG_CROSS_TIME) * depthSpeed;
 
     state.clips.push({
       source,
       sourceIndex: entry.sourceIndex,
       birthTime: entry.birthTime,
-      deathTime: entry.deathTime,
       pos: { x: startX, y },
       baseVx,
       baseY: y,
       size,
-      rotation: (Math.random() - 0.5) * 0.08,
+      depth,
       noiseSeed: Math.random() * 10000,
     });
   }
+
+  const AVG_CROSS_TIME = 9;
 
   function updateClips(dt) {
     const t = state.time;
@@ -233,84 +267,99 @@
         c.baseY +
         Math.sin(phase) * c.size * 0.12 +
         Math.sin(phase * 0.37 + 1.3) * c.size * 0.06;
-      // Slight rotation sway
-      c.rotation = Math.sin(phase * 0.5) * 0.06;
     }
-    // Remove finished clips
-    state.clips = state.clips.filter((c) => t < c.deathTime + 0.2);
+    // Remove clips that have drifted off the left edge
+    state.clips = state.clips.filter((c) => c.pos.x > -c.size);
   }
 
   function randRange(a, b) {
     return a + Math.random() * (b - a);
   }
 
-  // ---------- Scheduler ----------
-  function buildSchedule() {
-    const total = state.sources.length;
-    if (total === 0) {
-      state.schedule = [];
-      return;
-    }
 
-    const duration = state.duration;
-    const startBuf = Math.min(2.5, duration * 0.1);
-    const endBuf = Math.min(6, duration * 0.15);
-    const firstBatch = Math.min(state.onscreenCount, total);
-
-    const schedule = [];
-
-    // First batch — staggered entry during startBuf
-    for (let i = 0; i < firstBatch; i++) {
-      const birth = (i / Math.max(1, firstBatch)) * startBuf;
-      schedule.push({ sourceIndex: i, birthTime: birth });
-    }
-
-    // Remaining — evenly spaced through middle phase
-    const remaining = total - firstBatch;
-    const midStart = startBuf;
-    const midEnd = duration - endBuf;
-    const midLen = Math.max(0.1, midEnd - midStart);
-    const interval = remaining > 0 ? midLen / remaining : 0;
-
-    for (let i = 0; i < remaining; i++) {
-      const birth = midStart + (i + 0.5) * interval;
-      schedule.push({ sourceIndex: firstBatch + i, birthTime: birth });
-    }
-
-    // Per-clip lifespan ≈ onscreen * interval, so roughly `onscreenCount`
-    // stay alive during the middle phase. Clamp so everyone finishes before
-    // `duration`.
-    const lifespan = Math.max(
-      state.fadeTime * 3,
-      Math.max(interval, 0.3) * firstBatch
-    );
-
-    for (const e of schedule) {
-      e.deathTime = Math.min(duration, e.birthTime + lifespan);
-    }
-
-    // Shuffle sourceIndex assignment so ordering isn't strictly by upload order
-    const shuffledSources = shuffledIndices(total);
-    schedule.forEach((e, i) => {
-      e.sourceIndex = shuffledSources[i];
+  // ---------- IndexedDB persistence ----------
+  const DB_NAME = 'bff-clips';
+  const STORE = 'files';
+  function openDB() {
+    return new Promise((res, rej) => {
+      const req = indexedDB.open(DB_NAME, 1);
+      req.onupgradeneeded = () => {
+        req.result.createObjectStore(STORE, { keyPath: 'id' });
+      };
+      req.onsuccess = () => res(req.result);
+      req.onerror = () => rej(req.error);
     });
-
-    // Sort by birthTime for spawn loop
-    schedule.sort((a, b) => a.birthTime - b.birthTime);
-    state.schedule = schedule;
   }
-
-  function shuffledIndices(n) {
-    const arr = Array.from({ length: n }, (_, i) => i);
-    for (let i = arr.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [arr[i], arr[j]] = [arr[j], arr[i]];
-    }
-    return arr;
+  async function dbPut(record) {
+    const db = await openDB();
+    return new Promise((res, rej) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      tx.objectStore(STORE).put(record);
+      tx.oncomplete = () => res();
+      tx.onerror = () => rej(tx.error);
+    });
+  }
+  async function dbGetAll() {
+    const db = await openDB();
+    return new Promise((res, rej) => {
+      const tx = db.transaction(STORE, 'readonly');
+      const req = tx.objectStore(STORE).getAll();
+      req.onsuccess = () => res(req.result || []);
+      req.onerror = () => rej(req.error);
+    });
+  }
+  async function dbDelete(id) {
+    const db = await openDB();
+    return new Promise((res, rej) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      tx.objectStore(STORE).delete(id);
+      tx.oncomplete = () => res();
+      tx.onerror = () => rej(tx.error);
+    });
+  }
+  async function dbClear() {
+    const db = await openDB();
+    return new Promise((res, rej) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      tx.objectStore(STORE).clear();
+      tx.oncomplete = () => res();
+      tx.onerror = () => rej(tx.error);
+    });
   }
 
   // ---------- File loading ----------
-  function addFiles(files) {
+  function makeSource(id, name, blob) {
+    const el = document.createElement('video');
+    el.src = URL.createObjectURL(blob);
+    el.muted = true;
+    el.loop = true;
+    el.playsInline = true;
+    el.preload = 'auto';
+    el.crossOrigin = 'anonymous';
+    el.style.position = 'fixed';
+    el.style.left = '-10000px';
+    el.style.top = '0';
+    el.style.width = '2px';
+    el.style.height = '2px';
+    el.style.opacity = '0';
+    el.style.pointerEvents = 'none';
+    document.body.appendChild(el);
+
+    const source = { id, el, name, ready: false };
+    state.sources.push(source);
+
+    el.addEventListener(
+      'loadedmetadata',
+      () => {
+        source.ready = true;
+        renderFileList();
+      },
+      { once: true }
+    );
+    return source;
+  }
+
+  async function addFiles(files) {
     const vidFiles = Array.from(files).filter((f) =>
       f.type.startsWith('video/')
     );
@@ -318,43 +367,46 @@
       setStatus('沒有偵測到影片檔', 'err');
       return;
     }
-
     for (const f of vidFiles) {
-      const el = document.createElement('video');
-      el.src = URL.createObjectURL(f);
-      el.muted = true;
-      el.loop = true;
-      el.playsInline = true;
-      el.preload = 'auto';
-      el.crossOrigin = 'anonymous';
-      // Position far offscreen instead of display:none so Chrome doesn't
-      // throttle/skip decoding frames for hidden <video> elements. We still
-      // draw them to the canvas via p.image().
-      el.style.position = 'fixed';
-      el.style.left = '-10000px';
-      el.style.top = '0';
-      el.style.width = '2px';
-      el.style.height = '2px';
-      el.style.opacity = '0';
-      el.style.pointerEvents = 'none';
-      document.body.appendChild(el);
-
-      const source = { el, name: f.name, ready: false };
-      state.sources.push(source);
-
-      el.addEventListener(
-        'loadedmetadata',
-        () => {
-          source.ready = true;
-          updateClipCount();
-        },
-        { once: true }
-      );
+      const id = `${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+      makeSource(id, f.name, f);
+      try {
+        await dbPut({ id, name: f.name, blob: f });
+      } catch (e) {
+        console.warn('無法儲存到瀏覽器（檔案可能太大）', e);
+      }
     }
-    updateClipCount();
+    renderFileList();
   }
 
-  function clearFiles() {
+  async function loadStoredFiles() {
+    try {
+      const records = await dbGetAll();
+      for (const r of records) makeSource(r.id, r.name, r.blob);
+      renderFileList();
+    } catch (e) {
+      console.warn('讀取本地素材失敗', e);
+    }
+  }
+
+  async function removeSource(id) {
+    const idx = state.sources.findIndex((s) => s.id === id);
+    if (idx === -1) return;
+    const s = state.sources[idx];
+    try {
+      s.el.pause();
+      URL.revokeObjectURL(s.el.src);
+      s.el.remove();
+    } catch (e) {}
+    state.sources.splice(idx, 1);
+    state.clips = state.clips.filter((c) => c.source !== s);
+    try {
+      await dbDelete(id);
+    } catch (e) {}
+    renderFileList();
+  }
+
+  async function clearFiles() {
     for (const s of state.sources) {
       try {
         s.el.pause();
@@ -364,15 +416,38 @@
     }
     state.sources = [];
     state.clips = [];
-    state.schedule = [];
-    state.nextScheduleIdx = 0;
-    updateClipCount();
+    try {
+      await dbClear();
+    } catch (e) {}
+    renderFileList();
   }
 
-  function updateClipCount() {
-    const el = document.getElementById('clip-count');
+  function renderFileList() {
+    const countEl = document.getElementById('clip-count');
     const n = state.sources.length;
-    el.textContent = n === 0 ? '尚未載入素材' : `已載入 ${n} 個素材`;
+    if (countEl) {
+      countEl.textContent = n === 0 ? '尚未載入素材' : `已載入 ${n} 個素材`;
+    }
+    const list = document.getElementById('file-list');
+    if (!list) return;
+    list.innerHTML = '';
+    for (const s of state.sources) {
+      const row = document.createElement('div');
+      row.className = 'file-row';
+      const name = document.createElement('span');
+      name.className = 'file-name';
+      name.textContent = s.name;
+      name.title = s.name;
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'file-del';
+      del.textContent = '×';
+      del.title = '刪除';
+      del.addEventListener('click', () => removeSource(s.id));
+      row.appendChild(name);
+      row.appendChild(del);
+      list.appendChild(row);
+    }
   }
 
   // ---------- Preview / Export ----------
@@ -396,8 +471,8 @@
   function resetPlayback() {
     state.time = 0;
     state.clips = [];
-    state.nextScheduleIdx = 0;
-    buildSchedule();
+    state.nextSourceIdx = 0;
+    state.lastSpawnTime = -Infinity; // allow first spawn immediately
     // Preload / start playback on every source so they're decoded and ready
     for (const s of state.sources) {
       try {
@@ -406,6 +481,31 @@
         if (pp && pp.catch) pp.catch(() => {});
       } catch (e) {}
     }
+    // Queue the first batch off-screen to the right so they stream in one by
+    // one from the right edge instead of the canvas starting empty.
+    if (state.sources.length > 0) {
+      const initial = state.onscreenCount;
+      const spacing = (state.canvasW * 1.1) / Math.max(1, initial);
+      for (let i = 0; i < initial; i++) {
+        const idx = state.nextSourceIdx++ % state.sources.length;
+        spawnClip({ sourceIndex: idx, birthTime: 0 });
+        const c = state.clips[state.clips.length - 1];
+        if (c) c.pos.x = state.canvasW + c.size * 0.6 + i * spacing;
+      }
+    }
+    state.lastSpawnTime = 0;
+  }
+
+  function waitSourcesReady(timeoutMs) {
+    return new Promise((resolve) => {
+      const start = performance.now();
+      const check = () => {
+        const allReady = state.sources.every((s) => s.el.readyState >= 2);
+        if (allReady || performance.now() - start > timeoutMs) resolve();
+        else requestAnimationFrame(check);
+      };
+      check();
+    });
   }
 
   async function startExport() {
@@ -422,56 +522,157 @@
     setStatus('準備錄影…');
     resetPlayback();
 
-    // Pick a supported webm mime type
-    const mimeType = pickMimeType();
-    if (!mimeType) {
-      setStatus('此瀏覽器不支援 MediaRecorder webm，無法匯出', 'err');
-      btn.disabled = false;
-      return;
+    // Wait for every source video to reach readyState >= 2 (have-current-data)
+    // so the first encoded frames actually contain pixels instead of blank
+    // canvas. Cap the wait so a broken source can't hang export indefinitely.
+    await waitSourcesReady(1500);
+
+    state.exportFormat = format;
+    if (format === 'mp4' || format === 'mov') {
+      const ok = await startMp4Export(btn);
+      if (!ok) return;
+    } else {
+      const ok = startWebmExport(btn);
+      if (!ok) return;
     }
-
-    const stream = window._p.canvas.captureStream(60);
-    state.recordedChunks = [];
-    state.recorder = new MediaRecorder(stream, {
-      mimeType,
-      videoBitsPerSecond: 12_000_000,
-    });
-
-    state.recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) state.recordedChunks.push(e.data);
-    };
-
-    state.recorder.onstop = async () => {
-      const webmBlob = new Blob(state.recordedChunks, { type: mimeType });
-      state.recordedChunks = [];
-      await handleExportBlob(webmBlob, format);
-      btn.disabled = false;
-    };
 
     state.exporting = true;
     state.running = true;
     state.lastRealTime = performance.now() / 1000;
-    state.recorder.start(500);
     setStatus(`錄影中…（0 / ${Math.round(state.duration)}s）`);
 
-    // Update status as we go
-    const tick = setInterval(() => {
+    state.statusTick = setInterval(() => {
       if (!state.exporting) {
-        clearInterval(tick);
+        clearInterval(state.statusTick);
+        state.statusTick = null;
         return;
       }
-      setStatus(
-        `錄影中…（${state.time.toFixed(1)} / ${state.duration}s）`
-      );
+      setStatus(`錄影中…（${state.time.toFixed(1)} / ${state.duration}s）`);
     }, 250);
   }
 
-  function stopExport() {
-    state.running = false;
-    if (state.recorder && state.recorder.state !== 'inactive') {
-      state.recorder.stop();
+  async function startMp4Export(btn) {
+    if (typeof VideoEncoder === 'undefined' || !window.Mp4Muxer) {
+      setStatus(
+        '此瀏覽器不支援 WebCodecs / mp4-muxer，請改選 webm',
+        'err'
+      );
+      btn.disabled = false;
+      return false;
     }
-    state.exporting = false;
+    const w = state.canvasW;
+    const h = state.canvasH;
+    const fps = 60;
+    const pixels = w * h;
+    const bitrate = Math.min(
+      80_000_000,
+      Math.max(8_000_000, Math.round(pixels * 0.12))
+    );
+
+    // Pick a codec level that supports the chosen resolution. 5.2 covers up
+    // to ~4K; 6.0 covers 8K. Fall back gracefully.
+    const candidates = ['avc1.640034', 'avc1.640033', 'avc1.42E034', 'avc1.42E033'];
+    let codec = null;
+    for (const c of candidates) {
+      try {
+        const res = await VideoEncoder.isConfigSupported({
+          codec: c,
+          width: w,
+          height: h,
+          bitrate,
+          framerate: fps,
+        });
+        if (res.supported) {
+          codec = c;
+          break;
+        }
+      } catch (e) {}
+    }
+    if (!codec) {
+      setStatus('此解析度不被 H.264 編碼器支援，請降低畫布尺寸', 'err');
+      btn.disabled = false;
+      return false;
+    }
+
+    const muxer = new Mp4Muxer.Muxer({
+      target: new Mp4Muxer.ArrayBufferTarget(),
+      video: { codec: 'avc', width: w, height: h, frameRate: fps },
+      fastStart: 'in-memory',
+      firstTimestampBehavior: 'offset',
+    });
+
+    const encoder = new VideoEncoder({
+      output: (chunk, meta) => {
+        // mp4-muxer v5 requires decoderConfig.colorSpace to be non-null at
+        // finalize().  Some browsers omit it; fill in BT.709 (standard SDR).
+        if (meta && meta.decoderConfig && !meta.decoderConfig.colorSpace) {
+          meta.decoderConfig.colorSpace = {
+            primaries: 'bt709',
+            transfer: 'bt709',
+            matrix: 'bt709',
+            fullRange: false,
+          };
+        }
+        muxer.addVideoChunk(chunk, meta);
+      },
+      error: (e) => {
+        console.error('VideoEncoder error', e);
+        setStatus('編碼錯誤：' + e.message, 'err');
+      },
+    });
+    encoder.configure({ codec, width: w, height: h, bitrate, framerate: fps });
+
+    // Create a dedicated 2D canvas for VideoFrame capture.
+    // VideoFrame(HTMLCanvasElement) internally reads the canvas's 2D rendering
+    // context colorSpace; if p5's canvas context is unavailable it throws
+    // "Cannot read properties of null (reading 'colorSpace')".  Drawing each
+    // frame into a fresh 2D canvas first avoids this.
+    const encodeCanvas = document.createElement('canvas');
+    encodeCanvas.width = w;
+    encodeCanvas.height = h;
+    // Explicit sRGB colorSpace so VideoFrames carry a valid colorSpace into
+    // the encoder's decoderConfig — mp4-muxer v5 dereferences it during
+    // finalize() and throws if null.
+    const encodeCtx = encodeCanvas.getContext('2d', { colorSpace: 'srgb' });
+
+    state.encoder = encoder;
+    state.muxer = muxer;
+    state.encodeCanvas = encodeCanvas;
+    state.encodeCtx = encodeCtx;
+    state.encoderFrameIdx = 0;
+    return true;
+  }
+
+  function startWebmExport(btn) {
+    const mimeType = pickMimeType();
+    if (!mimeType) {
+      setStatus('此瀏覽器不支援 MediaRecorder webm，無法匯出', 'err');
+      btn.disabled = false;
+      return false;
+    }
+    const stream = window._p.canvas.captureStream(60);
+    state.recordedChunks = [];
+    const pixels = state.canvasW * state.canvasH;
+    const bitrate = Math.min(
+      80_000_000,
+      Math.max(8_000_000, Math.round(pixels * 5))
+    );
+    state.recorder = new MediaRecorder(stream, {
+      mimeType,
+      videoBitsPerSecond: bitrate,
+    });
+    state.recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) state.recordedChunks.push(e.data);
+    };
+    state.recorder.onstop = () => {
+      const blob = new Blob(state.recordedChunks, { type: mimeType });
+      state.recordedChunks = [];
+      downloadBlob(blob, `floating_${ts()}.webm`);
+      setStatus('完成！webm 已下載', 'ok');
+      btn.disabled = false;
+    };
+    state.recorder.start(500);
+    return true;
   }
 
   function pickMimeType() {
@@ -486,24 +687,50 @@
     return null;
   }
 
-  async function handleExportBlob(webmBlob, format) {
-    if (format === 'webm') {
-      downloadBlob(webmBlob, `floating_${ts()}.webm`);
-      setStatus('完成！webm 已下載', 'ok');
-      return;
+  function stopExport() {
+    if (!state.exporting) return;
+    state.running = false;
+    state.exporting = false;
+    if (state.statusTick) {
+      clearInterval(state.statusTick);
+      state.statusTick = null;
     }
+    if (state.exportFormat === 'mp4' || state.exportFormat === 'mov') {
+      finalizeMp4Export();
+    } else if (state.exportFormat === 'webm') {
+      if (state.recorder && state.recorder.state !== 'inactive') {
+        state.recorder.stop();
+      }
+    }
+  }
 
-    setStatus('轉檔中（webm → ' + format + '）… 這可能需要幾分鐘');
+  async function finalizeMp4Export() {
+    const btn = document.getElementById('btn-export');
     try {
-      const out = await window.BFFConvert.convert(webmBlob, format, (msg) => {
-        setStatus(msg);
-      });
-      downloadBlob(out, `floating_${ts()}.${format}`);
-      setStatus(`完成！${format} 已下載`, 'ok');
-    } catch (err) {
-      console.error(err);
-      setStatus('轉檔失敗：' + err.message + '（改下載 webm）', 'err');
-      downloadBlob(webmBlob, `floating_${ts()}.webm`);
+      setStatus('完成編碼中…');
+      await state.encoder.flush();
+      state.muxer.finalize();
+      const buffer = state.muxer.target.buffer;
+      const isMov = state.exportFormat === 'mov';
+      const mime = isMov ? 'video/quicktime' : 'video/mp4';
+      const ext = isMov ? 'mov' : 'mp4';
+      downloadBlob(
+        new Blob([buffer], { type: mime }),
+        `floating_${ts()}.${ext}`
+      );
+      setStatus(`完成！${ext} 已下載`, 'ok');
+    } catch (e) {
+      console.error(e);
+      setStatus('匯出失敗：' + e.message, 'err');
+    } finally {
+      try {
+        state.encoder && state.encoder.close();
+      } catch (e) {}
+      state.encoder = null;
+      state.muxer = null;
+      state.encodeCanvas = null;
+      state.encodeCtx = null;
+      btn.disabled = false;
     }
   }
 
@@ -568,6 +795,8 @@
     });
     $('btn-clear').addEventListener('click', clearFiles);
 
+    loadStoredFiles();
+
     // Controls
     const bind = (id, valId, transform, onChange) => {
       const el = $(id);
@@ -587,15 +816,32 @@
     bind('duration', 'duration-val', parseInt, (v) => (state.duration = v));
     bind('minw', 'minw-val', parseInt, (v) => (state.minW = v));
     bind('maxw', 'maxw-val', parseInt, (v) => (state.maxW = v));
-    bind('fade', 'fade-val', parseFloat, (v) => (state.fadeTime = v));
 
-    $('canvas-size').addEventListener('change', (e) => {
-      const [w, h] = e.target.value.split('x').map(Number);
+    const wIn = $('canvas-w');
+    const hIn = $('canvas-h');
+    const preset = $('canvas-preset');
+    const applyCanvasSize = () => {
+      const w = Math.max(320, Math.min(7680, parseInt(wIn.value, 10) || 1920));
+      const h = Math.max(180, Math.min(4320, parseInt(hIn.value, 10) || 1080));
       state.canvasW = w;
       state.canvasH = h;
       window._p.resizeCanvas(w, h);
       if (window._p.exposeFit) window._p.exposeFit();
+    };
+    preset.addEventListener('change', (e) => {
+      if (e.target.value === 'custom') return;
+      const [w, h] = e.target.value.split('x').map(Number);
+      wIn.value = w;
+      hIn.value = h;
+      applyCanvasSize();
     });
+    [wIn, hIn].forEach((el) =>
+      el.addEventListener('input', () => {
+        preset.value = 'custom';
+        applyCanvasSize();
+      })
+    );
+    applyCanvasSize();
 
     $('btn-preview').addEventListener('click', startPreview);
     $('btn-stop').addEventListener('click', () => {
@@ -609,8 +855,6 @@
     switch (id) {
       case 'speed':
         return v.toFixed(1) + 'x';
-      case 'fade':
-        return v.toFixed(1);
       default:
         return String(v);
     }

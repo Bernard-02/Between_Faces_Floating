@@ -6,7 +6,7 @@
     <title>Between Faces Floating</title>
     <link rel="stylesheet" href="styles.css" />
     <script src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/[email protected]/dist/ffmpeg.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mp4-muxer@5/build/mp4-muxer.min.js"></script>
   </head>
   <body>
     <header class="topbar">
@@ -32,6 +32,7 @@
               hidden
             />
           </label>
+          <div id="file-list" class="file-list"></div>
         </section>
 
         <section class="panel">
@@ -41,14 +42,14 @@
           </div>
           <div class="ctrl">
             <label>
-              漂浮速度 <span class="val" id="speed-val">1.0x</span>
-              <input id="speed" type="range" min="0.2" max="3" step="0.1" value="1" />
+              漂浮速度 <span class="val" id="speed-val">0.5x</span>
+              <input id="speed" type="range" min="0.2" max="3" step="0.1" value="0.5" />
             </label>
           </div>
           <div class="ctrl">
             <label>
-              同屏數量 <span class="val" id="onscreen-val">15</span>
-              <input id="onscreen" type="range" min="3" max="60" step="1" value="15" />
+              同屏數量 <span class="val" id="onscreen-val">10</span>
+              <input id="onscreen" type="range" min="3" max="60" step="1" value="10" />
             </label>
           </div>
           <div class="ctrl">
@@ -60,31 +61,32 @@
           <div class="ctrl">
             <label>
               素材最小寬（px） <span class="val" id="minw-val">160</span>
-              <input id="minw" type="range" min="60" max="400" step="10" value="160" />
+              <input id="minw" type="range" min="40" max="600" step="10" value="160" />
             </label>
           </div>
           <div class="ctrl">
             <label>
               素材最大寬（px） <span class="val" id="maxw-val">320</span>
-              <input id="maxw" type="range" min="120" max="700" step="10" value="320" />
+              <input id="maxw" type="range" min="100" max="1200" step="10" value="320" />
             </label>
           </div>
           <div class="ctrl">
-            <label>
-              畫布尺寸
-              <select id="canvas-size">
-                <option value="1920x1080">1920 × 1080（16:9）</option>
-                <option value="1080x1080">1080 × 1080（1:1）</option>
-                <option value="1080x1920">1080 × 1920（9:16）</option>
-                <option value="1280x720">1280 × 720（16:9 輕量）</option>
-              </select>
-            </label>
-          </div>
-          <div class="ctrl">
-            <label>
-              進/退場時間（秒） <span class="val" id="fade-val">0.8</span>
-              <input id="fade" type="range" min="0.2" max="2.5" step="0.1" value="0.8" />
-            </label>
+            <label>畫布尺寸（投影牆 850×300 cm → 17:6）</label>
+            <select id="canvas-preset">
+              <option value="1700x600">1700 × 600（17:6 預覽）</option>
+              <option value="3400x1200" selected>3400 × 1200（17:6 4 px/cm）</option>
+              <option value="4080x1440">4080 × 1440（17:6 4.8 px/cm）</option>
+              <option value="5100x1800">5100 × 1800（17:6 6 px/cm ≈ 5K）</option>
+              <option value="3840x2160">3840 × 2160（4K UHD 16:9）</option>
+              <option value="1920x1080">1920 × 1080（16:9）</option>
+              <option value="custom">自訂…</option>
+            </select>
+            <div class="size-inputs">
+              <input id="canvas-w" type="number" min="320" max="7680" step="10" value="3400" />
+              <span>×</span>
+              <input id="canvas-h" type="number" min="180" max="4320" step="10" value="1200" />
+              <span class="muted">px</span>
+            </div>
           </div>
         </section>
 
@@ -98,9 +100,9 @@
             <label class="inline">
               輸出格式
               <select id="out-format">
-                <option value="mp4">mp4（H.264）</option>
-                <option value="mov">mov（H.264）</option>
-                <option value="webm">webm（原始）</option>
+                <option value="mp4" selected>mp4（H.264，WebCodecs）</option>
+                <option value="mov">mov（H.264，QuickTime 容器）</option>
+                <option value="webm">webm（VP9，MediaRecorder）</option>
               </select>
             </label>
           </div>
@@ -118,6 +120,5 @@
     </main>
 
     <script src="sketch.js"></script>
-    <script src="ffmpeg-worker.js"></script>
   </body>
 </html>
