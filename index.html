@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Between Faces Floating</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/[email protected]/dist/ffmpeg.min.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <h1>Between Faces Floating</h1>
+      <div class="top-actions">
+        <span id="clip-count" class="muted">尚未載入素材</span>
+        <button id="btn-clear" class="ghost" type="button">清除素材</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="sidebar">
+        <section class="panel">
+          <h2>1. 上傳素材</h2>
+          <label id="drop-zone" for="file-input">
+            <span class="drop-main">拖放影片到這裡</span>
+            <span class="drop-sub">或 點擊選擇檔案（可多選）</span>
+            <input
+              id="file-input"
+              type="file"
+              accept="video/*"
+              multiple
+              hidden
+            />
+          </label>
+        </section>
+
+        <section class="panel">
+          <h2>2. 控制</h2>
+          <div class="ctrl">
+            <label>背景色 <input id="bg-color" type="color" value="#0a0a0a" /></label>
+          </div>
+          <div class="ctrl">
+            <label>
+              漂浮速度 <span class="val" id="speed-val">1.0x</span>
+              <input id="speed" type="range" min="0.2" max="3" step="0.1" value="1" />
+            </label>
+          </div>
+          <div class="ctrl">
+            <label>
+              同屏數量 <span class="val" id="onscreen-val">15</span>
+              <input id="onscreen" type="range" min="3" max="60" step="1" value="15" />
+            </label>
+          </div>
+          <div class="ctrl">
+            <label>
+              輸出時長（秒） <span class="val" id="duration-val">150</span>
+              <input id="duration" type="range" min="15" max="300" step="5" value="150" />
+            </label>
+          </div>
+          <div class="ctrl">
+            <label>
+              素材最小寬（px） <span class="val" id="minw-val">160</span>
+              <input id="minw" type="range" min="60" max="400" step="10" value="160" />
+            </label>
+          </div>
+          <div class="ctrl">
+            <label>
+              素材最大寬（px） <span class="val" id="maxw-val">320</span>
+              <input id="maxw" type="range" min="120" max="700" step="10" value="320" />
+            </label>
+          </div>
+          <div class="ctrl">
+            <label>
+              畫布尺寸
+              <select id="canvas-size">
+                <option value="1920x1080">1920 × 1080（16:9）</option>
+                <option value="1080x1080">1080 × 1080（1:1）</option>
+                <option value="1080x1920">1080 × 1920（9:16）</option>
+                <option value="1280x720">1280 × 720（16:9 輕量）</option>
+              </select>
+            </label>
+          </div>
+          <div class="ctrl">
+            <label>
+              進/退場時間（秒） <span class="val" id="fade-val">0.8</span>
+              <input id="fade" type="range" min="0.2" max="2.5" step="0.1" value="0.8" />
+            </label>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>3. 預覽 / 輸出</h2>
+          <div class="row">
+            <button id="btn-preview" type="button">▶︎ 預覽</button>
+            <button id="btn-stop" type="button" class="ghost">■ 停止</button>
+          </div>
+          <div class="row">
+            <label class="inline">
+              輸出格式
+              <select id="out-format">
+                <option value="mp4">mp4（H.264）</option>
+                <option value="mov">mov（H.264）</option>
+                <option value="webm">webm（原始）</option>
+              </select>
+            </label>
+          </div>
+          <div class="row">
+            <button id="btn-export" type="button" class="primary">⬇︎ 匯出影片</button>
+          </div>
+          <div id="status" class="status"></div>
+          <progress id="progress" value="0" max="1" hidden></progress>
+        </section>
+      </aside>
+
+      <section class="stage">
+        <div id="canvas-wrap"></div>
+      </section>
+    </main>
+
+    <script src="sketch.js"></script>
+    <script src="ffmpeg-worker.js"></script>
+  </body>
+</html>
